@@ -169,7 +169,7 @@ fn get_vout(tx: &Transaction, spk: &Script) -> (OutPoint, TxOut) {
 }
 
 fn convert_shares_json(json_with_shares: &JSONDataWithShares) -> JSONData {
-    let mut packages: BTreeMap<Identifier, KeyPackage> = BTreeMap::new(); 
+    let mut packages: BTreeMap<Identifier, KeyPackage> = BTreeMap::new();
     for (idx, share) in json_with_shares.shares.iter() {
         let package = KeyPackage::try_from(share.clone()).unwrap();
         packages.insert(*idx, package);
