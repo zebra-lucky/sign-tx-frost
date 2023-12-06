@@ -7,7 +7,10 @@ use std::collections::{HashMap, BTreeMap};
 use std::convert::{From, TryFrom};
 use frost_secp256k1_tr as frost;
 use frost_secp256k1_tr::{Identifier, tweaked_public_key, Signature};
-use frost_secp256k1_tr::keys::{PublicKeyPackage, SecretShare};
+use frost_secp256k1_tr::keys::{
+    KeyPackage, PublicKeyPackage, SecretShare,
+    {dkg::round1, dkg::round2}
+};
 use rand::thread_rng;
 use serde::{Deserialize, Serialize};
 use std::{fs};
@@ -25,29 +28,126 @@ use miniscript::bitcoin::{
 use miniscript::bitcoin::consensus::encode::deserialize;
 use k256::{elliptic_curve::{group::{GroupEncoding}}};
 
-
-#[derive(Deserialize, Serialize)]
-struct JSONData {
+#[derive(Deserialize, Serialize, Debug)]
+struct JSONDataWithShares {
     m: u16,
     n: u16,
     pubkey_package: PublicKeyPackage,
     shares: BTreeMap<Identifier, SecretShare>,
 }
 
-fn frost_gen_data(
+#[derive(Deserialize, Serialize, Debug)]
+struct JSONData {
     m: u16,
     n: u16,
-) -> JSONData {
+    pubkey_package: PublicKeyPackage,
+    packages: BTreeMap<Identifier, KeyPackage>,
+}
+
+fn frost_gen_data_with_dealer(
+    m: u16,
+    n: u16,
+) -> Option<JSONData> {
     let mut rng = thread_rng();
     let (shares, pubkey_package) = frost::keys::generate_with_dealer(
         n, m, frost::keys::IdentifierList::Default, &mut rng
     ).unwrap();
+    let mut packages: BTreeMap<Identifier, KeyPackage> = BTreeMap::new();
+    for (idx, share) in shares.iter() {
+        let package = KeyPackage::try_from(share.clone()).unwrap();
+        packages.insert(*idx, package);
+    }
     let json_data = JSONData {
-        m: m,
-        n: n,
-        pubkey_package: pubkey_package,
-        shares: shares,
+        m,
+        n,
+        pubkey_package,
+        packages,
     };
+    Some(json_data)
+}
+
+fn frost_gen_data_dkg(
+    m: u16,
+    n: u16,
+) -> Option<JSONData> {
+    let mut rng = thread_rng();
+    let ids = (1..=n)
+        .map(|i| Identifier::try_from(i).expect("nonzero"))
+        .collect::<Vec<_>>();
+    // part1
+    let mut r1_sec_packages: BTreeMap<Identifier, round1::SecretPackage> =
+        BTreeMap::new();
+    let mut r1_packages: BTreeMap<Identifier, round1::Package> =
+        BTreeMap::new();
+    for idx in ids.iter() {
+        let (r1_sec_package, r1_package) = frost::keys::dkg::part1(
+            *idx, n, m, &mut rng,
+        ).unwrap();
+        r1_sec_packages.insert(*idx, r1_sec_package);
+        r1_packages.insert(*idx, r1_package);
+    }
+    // part2
+    let mut r2_sec_packages: BTreeMap<Identifier, round2::SecretPackage> =
+        BTreeMap::new();
+    let mut r2_packages_map: BTreeMap<Identifier,
+                                      BTreeMap<Identifier, round2::Package>> =
+        BTreeMap::new();
+    for idx in ids.iter() {
+        let r1_sec_package = r1_sec_packages.get(idx).unwrap();
+        let mut r1_others_packages = r1_packages.clone();
+        r1_others_packages.remove(idx);
+        let (r2_sec_package, r2_packages) =
+            frost::keys::dkg::part2(
+                r1_sec_package.clone(), &r1_others_packages
+            ).unwrap();
+        r2_sec_packages.insert(*idx, r2_sec_package);
+        r2_packages_map.insert(*idx, r2_packages);
+    }
+
+    // part3
+    let mut packages: BTreeMap<Identifier, KeyPackage> =
+        BTreeMap::new();
+    let mut pubkey_packages: BTreeMap<Identifier, PublicKeyPackage> =
+        BTreeMap::new();
+    for idx in ids.iter() {
+        let mut r1_others_packages = r1_packages.clone();
+        r1_others_packages.remove(idx);
+        let r2_sec_package = r2_sec_packages.get(idx).unwrap();
+        let mut r2_packages: BTreeMap<Identifier, round2::Package> =
+            BTreeMap::new();
+        for idx2 in ids.iter() {
+            if idx2 != idx {
+                let r2_others_packages = r2_packages_map.get(idx2).unwrap();
+                r2_packages.insert(
+                    *idx2, r2_others_packages.get(idx).unwrap().clone()
+                );
+            }
+        }
+        let (key_package, pubkey_package) = frost::keys::dkg::part3(
+            r2_sec_package,
+            &r1_others_packages,
+            &r2_packages,
+        ).unwrap();
+        packages.insert(*idx, key_package);
+        pubkey_packages.insert(*idx, pubkey_package);
+    }
+
+    let (_idx , pubkey_package) = pubkey_packages.iter().next_back().unwrap();
+    let json_data = JSONData {
+        m,
+        n,
+        pubkey_package: pubkey_package.clone(),
+        packages,
+    };
+    Some(json_data)
+}
+
+fn read_json_with_shares(f_path: &PathBuf) -> JSONDataWithShares {
+    let f_content = fs::read_to_string(&f_path).unwrap_or_else(|error| {
+		panic!("Error reading file: \"{}\": {}", f_path.display(), error)
+	});
+    let json_data: JSONDataWithShares = serde_json::from_str(&f_content)
+        .unwrap();
     json_data
 }
 
@@ -55,7 +155,7 @@ fn read_json(f_path: &PathBuf) -> JSONData {
     let f_content = fs::read_to_string(&f_path).unwrap_or_else(|error| {
 		panic!("Error reading file: \"{}\": {}", f_path.display(), error)
 	});
-    let json_data: JSONData  = serde_json::from_str(&f_content).unwrap();
+    let json_data: JSONData = serde_json::from_str(&f_content).unwrap();
     json_data
 }
 
@@ -66,6 +166,21 @@ fn get_vout(tx: &Transaction, spk: &Script) -> (OutPoint, TxOut) {
         }
     }
     panic!("Only call get vout on functions which have the expected outpoint");
+}
+
+fn convert_shares_json(json_with_shares: &JSONDataWithShares) -> JSONData {
+    let mut packages: BTreeMap<Identifier, KeyPackage> = BTreeMap::new(); 
+    for (idx, share) in json_with_shares.shares.iter() {
+        let package = KeyPackage::try_from(share.clone()).unwrap();
+        packages.insert(*idx, package);
+    }
+    let json_data = JSONData {
+        m: json_with_shares.m,
+        n: json_with_shares.n,
+        pubkey_package: json_with_shares.pubkey_package.clone(),
+        packages,
+    };
+    json_data
 }
 
 fn get_group_address(json_data: &JSONData) -> Address {
@@ -161,7 +276,7 @@ fn frost_sign(
     // through a confidential and authenticated channel.
     let mut key_packages: HashMap<_, _> = HashMap::new();
 
-    for (identifier, signing_share) in json_data.shares.clone() {
+    for (identifier, signing_share) in json_data.packages.clone() {
         let key_package = frost::keys::KeyPackage::try_from(signing_share);
         key_packages.insert(identifier, key_package);
     }
@@ -294,7 +409,20 @@ fn cli() -> Command {
                     arg!(<n> "maximum number of signers")
                         .value_parser(value_parser!(u16).range(2..))
                 )
+                .arg(
+                    arg!(--dealer "use trusted dealer generation")
+                )
                 .arg_required_else_help(true)
+        )
+        .subcommand(
+            Command::new("convert")
+                .about("Convert JSON with SecretShare to KeyPackage format")
+                .arg(
+                    arg!(<PATH> "path of parties data JSON")
+                        .default_value("testdata.json")
+                        .required(false)
+                        .value_parser(clap::value_parser!(PathBuf))
+                )
         )
         .subcommand(
             Command::new("address")
@@ -340,7 +468,21 @@ fn main() {
         Some(("generate", sub_matches)) => {
             let m = *sub_matches.get_one::<u16>("m").unwrap();
             let n = *sub_matches.get_one::<u16>("n").unwrap();
-            let json_data = frost_gen_data(m, n);
+            let with_dealer = *sub_matches.get_one::<bool>("dealer")
+                .unwrap();
+            let json_data = if with_dealer {
+                 frost_gen_data_with_dealer(m, n)
+            } else {
+                 frost_gen_data_dkg(m, n)
+            };
+            let json_str = serde_json::to_string_pretty(&json_data).unwrap();
+            println!("{}", json_str);
+        }
+        Some(("convert", sub_matches)) => {
+            let f_path = sub_matches.get_one::<PathBuf>("PATH").unwrap();
+            let json_data = convert_shares_json(
+                &read_json_with_shares(f_path)
+            );
             let json_str = serde_json::to_string_pretty(&json_data).unwrap();
             println!("{}", json_str);
         }
