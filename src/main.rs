@@ -11,11 +11,12 @@ use frost_secp256k1_tr::keys::{
     KeyPackage, PublicKeyPackage, SecretShare,
     {dkg::round1, dkg::round2}
 };
-use rand::thread_rng;
+use rand::{thread_rng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::{fs};
 use ::bitcoin::key::{XOnlyPublicKey, PublicKey};
 use ::bitcoin::secp256k1::schnorr::{Signature as SchnorrSignature};
+use ::bitcoin::secp256k1::Message;
 use miniscript::bitcoin::hashes::hex::FromHex;
 use miniscript::bitcoin::{Address, Network};
 use miniscript::{DefiniteDescriptorKey, Descriptor};
@@ -392,6 +393,34 @@ fn send_to_address(
     println!("Resulting Tx:\n{}", hex_tx);
 }
 
+fn test_tweaked_sign_verify(json_data: JSONData) {
+    let mut message = [0; 32];
+    let mut rng = thread_rng();
+    rng.fill_bytes(&mut message);
+    let group_signature = frost_sign(&json_data, &message);
+    let is_signature_valid = json_data.pubkey_package
+        .verifying_key()
+        .verify(&message, &group_signature)
+        .is_ok();
+    println!("is_signature_valid={}", is_signature_valid);
+    let verifying_key_b = json_data.pubkey_package.verifying_key();
+    let tpk = tweaked_public_key(&verifying_key_b.clone().element(), &[]);
+    dbg!(hex::encode(&tpk.to_affine().to_bytes()));
+    let tpk_b = tpk.to_bytes();
+    let tpk_pk = PublicKey::from_slice(&tpk_b).unwrap();
+    #[allow(unused)]
+    let tpk_x = XOnlyPublicKey::from(tpk_pk.inner);
+    let secp = secp256k1::Secp256k1::new();
+    let sig_b = group_signature.serialize();
+    let sig = SchnorrSignature::from_slice(&sig_b[1..]).unwrap();
+    let msg = Message::from_slice(&message).unwrap();
+    let secp_verify_res = match secp.verify_schnorr(&sig, &msg, &tpk_x) {
+        Ok(_) => "Ok",
+        Err(_) => "Invalid Signature",
+    };
+    println!("Check signature vis secp256k1: {}", secp_verify_res);
+}
+
 fn cli() -> Command {
     Command::new("sign-tx-frost")
         .about("Tests on signing transactions with FROST/Taproot")
@@ -411,6 +440,9 @@ fn cli() -> Command {
                 )
                 .arg(
                     arg!(--dealer "use trusted dealer generation")
+                )
+                .arg(
+                    arg!(--"test-tweaked" "Test sign with tweak on random data")
                 )
                 .arg_required_else_help(true)
         )
@@ -461,6 +493,10 @@ fn cli() -> Command {
         )
 }
 
+pub fn type_of<T>(_: T) -> &'static str {
+    std::any::type_name::<T>()
+}
+
 fn main() {
     let matches = cli().get_matches();
 
@@ -470,13 +506,18 @@ fn main() {
             let n = *sub_matches.get_one::<u16>("n").unwrap();
             let with_dealer = *sub_matches.get_one::<bool>("dealer")
                 .unwrap();
+            let test_tweak = *sub_matches.get_one::<bool>("test-tweaked")
+                .unwrap();
             let json_data = if with_dealer {
                  frost_gen_data_with_dealer(m, n)
             } else {
                  frost_gen_data_dkg(m, n)
             };
             let json_str = serde_json::to_string_pretty(&json_data).unwrap();
-            println!("{}", json_str);
+            println!("{}\n", json_str);
+            if test_tweak {
+                test_tweaked_sign_verify(json_data.unwrap());
+            }
         }
         Some(("convert", sub_matches)) => {
             let f_path = sub_matches.get_one::<PathBuf>("PATH").unwrap();
