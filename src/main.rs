@@ -404,6 +404,25 @@ fn test_tweaked_sign_verify(json_data: JSONData) {
         .is_ok();
     println!("is_signature_valid={}", is_signature_valid);
     let verifying_key_b = json_data.pubkey_package.verifying_key();
+    dbg!(hex::encode(&verifying_key_b.element().to_affine().to_bytes()));
+
+    let pubk = PublicKey::from_slice(&verifying_key_b.serialize()[..]).unwrap();
+    let xpubk = XOnlyPublicKey::from(pubk.inner);
+    let xpubk_hex = hex::encode(&xpubk.serialize());
+    let s = format!("tr({})", xpubk_hex);
+    let d = Descriptor::<DefiniteDescriptorKey>::from_str(&s).unwrap();
+    use miniscript::Descriptor::{Tr};
+    match d {
+        Tr(v) => {
+            let si = v.spend_info();
+            println!("orig: {}", hex::encode(si.internal_key().serialize()));
+            println!("spending: {}", hex::encode(si.output_key().serialize()));
+            dbg!(si.output_key_parity());
+            ()
+        },
+        _ => panic!("unknown"),
+    }
+
     let tpk = tweaked_public_key(&verifying_key_b.clone().element(), &[]);
     dbg!(hex::encode(&tpk.to_affine().to_bytes()));
     let tpk_b = tpk.to_bytes();
@@ -418,7 +437,7 @@ fn test_tweaked_sign_verify(json_data: JSONData) {
         Ok(_) => "Ok",
         Err(_) => "Invalid Signature",
     };
-    println!("Check signature vis secp256k1: {}", secp_verify_res);
+    println!("Check signature with secp256k1: {}", secp_verify_res);
 }
 
 fn cli() -> Command {
@@ -445,6 +464,16 @@ fn cli() -> Command {
                     arg!(--"test-tweaked" "Test sign with tweak on random data")
                 )
                 .arg_required_else_help(true)
+        )
+        .subcommand(
+            Command::new("testsign")
+                .about("Test sign/verify on early generated JSON data")
+                .arg(
+                    arg!(<PATH> "path of parties data JSON")
+                        .default_value("testdata.json")
+                        .required(false)
+                        .value_parser(clap::value_parser!(PathBuf))
+                )
         )
         .subcommand(
             Command::new("convert")
@@ -518,6 +547,11 @@ fn main() {
             if test_tweak {
                 test_tweaked_sign_verify(json_data.unwrap());
             }
+        }
+        Some(("testsign", sub_matches)) => {
+            let f_path = sub_matches.get_one::<PathBuf>("PATH").unwrap();
+            let json_data = read_json(f_path);
+            test_tweaked_sign_verify(json_data);
         }
         Some(("convert", sub_matches)) => {
             let f_path = sub_matches.get_one::<PathBuf>("PATH").unwrap();
