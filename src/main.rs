@@ -6,7 +6,7 @@ use hex;
 use std::collections::{HashMap, BTreeMap};
 use std::convert::{From, TryFrom};
 use frost_secp256k1_tr as frost;
-use frost_secp256k1_tr::{Identifier, tweaked_public_key, Signature};
+use frost_secp256k1_tr::{Identifier, Signature};
 use frost_secp256k1_tr::keys::{
     KeyPackage, PublicKeyPackage, SecretShare,
     {dkg::round1, dkg::round2}
@@ -14,7 +14,7 @@ use frost_secp256k1_tr::keys::{
 use rand::{thread_rng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::{fs};
-use ::bitcoin::key::{XOnlyPublicKey, PublicKey};
+use ::bitcoin::key::{XOnlyPublicKey, PublicKey, UntweakedPublicKey, TapTweak};
 use ::bitcoin::secp256k1::schnorr::{Signature as SchnorrSignature};
 use ::bitcoin::secp256k1::Message;
 use miniscript::bitcoin::hashes::hex::FromHex;
@@ -27,7 +27,6 @@ use miniscript::bitcoin::{
     self, psbt, secp256k1, OutPoint, Script, Transaction, TxIn, TxOut
 };
 use miniscript::bitcoin::consensus::encode::deserialize;
-use k256::{elliptic_curve::{group::{GroupEncoding}}};
 
 #[derive(Deserialize, Serialize, Debug)]
 struct JSONDataWithShares {
@@ -380,12 +379,11 @@ fn send_to_address(
     });
 
     let secp = secp256k1::Secp256k1::new();
-    let tpk = tweaked_public_key(&verifying_key_b.clone().element(), &[]);
-    let tpk_b = tpk.to_bytes();
-    let tpk_pk = PublicKey::from_slice(&tpk_b).unwrap();
+    let pubk = PublicKey::from_slice(&verifying_key_b.serialize()[..]).unwrap();
+    let utpk = UntweakedPublicKey::from(pubk.inner);
     #[allow(unused)]
-    let tpk_x = XOnlyPublicKey::from(tpk_pk.inner);
-    //dbg!(secp.verify_schnorr(&sig, &msg, &tpk_x));
+    let (tpk, _) = utpk.tap_tweak(&secp, None);
+    //dbg!(secp.verify_schnorr(&sig, &msg, &tpk.to_inner()));
     psbt.finalize_mut(&secp).unwrap();
     let tx = psbt.extract_tx();
     println!("\nDebug resulting Tx: \n{:#?}\n", &tx);
@@ -404,8 +402,6 @@ fn test_tweaked_sign_verify(json_data: JSONData) {
         .is_ok();
     println!("is_signature_valid={}", is_signature_valid);
     let verifying_key_b = json_data.pubkey_package.verifying_key();
-    dbg!(hex::encode(&verifying_key_b.element().to_affine().to_bytes()));
-
     let pubk = PublicKey::from_slice(&verifying_key_b.serialize()[..]).unwrap();
     let xpubk = XOnlyPublicKey::from(pubk.inner);
     let xpubk_hex = hex::encode(&xpubk.serialize());
@@ -423,17 +419,13 @@ fn test_tweaked_sign_verify(json_data: JSONData) {
         _ => panic!("unknown"),
     }
 
-    let tpk = tweaked_public_key(&verifying_key_b.clone().element(), &[]);
-    dbg!(hex::encode(&tpk.to_affine().to_bytes()));
-    let tpk_b = tpk.to_bytes();
-    let tpk_pk = PublicKey::from_slice(&tpk_b).unwrap();
-    #[allow(unused)]
-    let tpk_x = XOnlyPublicKey::from(tpk_pk.inner);
     let secp = secp256k1::Secp256k1::new();
+    let utpk = UntweakedPublicKey::from(pubk.inner);
+    let (tpk, _) = utpk.tap_tweak(&secp, None);
     let sig_b = group_signature.serialize();
     let sig = SchnorrSignature::from_slice(&sig_b[1..]).unwrap();
     let msg = Message::from_slice(&message).unwrap();
-    let secp_verify_res = match secp.verify_schnorr(&sig, &msg, &tpk_x) {
+    let secp_verify_res = match secp.verify_schnorr(&sig, &msg, &tpk.to_inner()) {
         Ok(_) => "Ok",
         Err(_) => "Invalid Signature",
     };
